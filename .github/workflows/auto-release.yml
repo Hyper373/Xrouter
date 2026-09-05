@@ -1,0 +1,160 @@
+name: Auto Release on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump"
+        required: false
+        default: patch
+        type: choice
+        options: [major, minor, patch]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Determine bump type
+        id: bump
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          DISPATCH_BUMP: ${{ inputs.bump }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          BUMP="patch"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            BUMP="$DISPATCH_BUMP"
+            echo "Manual bump=$BUMP"
+          else
+            echo "PR title: $PR_TITLE"
+            echo "PR labels: $PR_LABELS"
+            if echo "$PR_LABELS" | grep -qi "major\|breaking"; then
+              BUMP="major"
+            elif echo "$PR_LABELS" | grep -qi "minor\|feature"; then
+              BUMP="minor"
+            elif echo "$PR_TITLE" | grep -qE '^feat(\(.+\))?!:'; then
+              BUMP="major"
+            elif echo "$PR_TITLE" | grep -qE '^feat'; then
+              BUMP="minor"
+            elif echo "$PR_TITLE" | grep -qE '^fix|^perf|^refactor'; then
+              BUMP="patch"
+            fi
+          fi
+          echo "type=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Bump type: $BUMP"
+
+      - name: Bump versions
+        id: version
+        env:
+          BUMP: ${{ steps.bump.outputs.type }}
+        run: |
+          node -e "
+          const fs=require('fs');
+          const semver=(v,bump)=>{
+            let [maj,min,patch]=v.split('.').map(Number);
+            if(bump==='major'){maj++;min=0;patch=0;}
+            else if(bump==='minor'){min++;patch=0;}
+            else {patch++;}
+            return maj+'.'+min+'.'+patch;
+          };
+          const bump=process.env.BUMP;
+          const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));
+          const old=pkg.version;
+          const neu=semver(old,bump);
+          console.log('Bump '+old+' -> '+neu+' ('+bump+')');
+          pkg.version=neu;
+          fs.writeFileSync('package.json',JSON.stringify(pkg,null,2)+'\n');
+          const cliPath='cli/package.json';
+          if(fs.existsSync(cliPath)){
+            const cli=JSON.parse(fs.readFileSync(cliPath,'utf8'));
+            cli.version=neu;
+            fs.writeFileSync(cliPath,JSON.stringify(cli,null,2)+'\n');
+            console.log('cli/package.json -> '+neu);
+          }
+          fs.writeFileSync('/tmp/new_version',neu);
+          fs.writeFileSync('/tmp/old_version',old);
+          "
+          NEW=$(cat /tmp/new_version)
+          OLD=$(cat /tmp/old_version)
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "old=$OLD" >> "$GITHUB_OUTPUT"
+          echo "Version $OLD -> $NEW"
+
+      - name: Update CHANGELOG.md
+        env:
+          NEW: ${{ steps.version.outputs.new }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          node -e "
+          const fs=require('fs');
+          const newVer=process.env.NEW;
+          const date=process.env.DATE;
+          const prNum=process.env.PR_NUM;
+          const prTitle=process.env.PR_TITLE;
+          const prUrl=process.env.PR_URL;
+          let body=(process.env.PR_BODY||'').trim();
+          if(!body) body=prTitle;
+          const header='# v'+newVer+' ('+date+')';
+          const entry=header+'\n\n- PR #'+prNum+': ['+prTitle+']('+prUrl+')\n\n'+body+'\n\n';
+          let changelog='';
+          try{changelog=fs.readFileSync('CHANGELOG.md','utf8');}catch(e){changelog='';}
+          fs.writeFileSync('CHANGELOG.md', entry + changelog);
+          console.log('CHANGELOG updated with '+header);
+          "
+
+      - name: Commit and tag
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          NEW="${{ steps.version.outputs.new }}"
+          BASE="${BASE_REF:-master}"
+          echo "Pushing to $BASE"
+          git add package.json cli/package.json CHANGELOG.md
+          git commit -m "chore(release): v${NEW} (PR #${PR_NUM} ${PR_TITLE})" || echo "nothing to commit"
+          git tag "v${NEW}"
+          git push origin "HEAD:${BASE}"
+          git push origin "v${NEW}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.new }}
+          name: v${{ steps.version.outputs.new }}
+          body: |
+            ## PR #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}
+
+            ${{ github.event.pull_request.body }}
+
+            ---
+            **Bump:** `${{ steps.bump.outputs.type }}` | **Version:** `${{ steps.version.outputs.old }}` -> `${{ steps.version.outputs.new }}`
+            **PR:** ${{ github.event.pull_request.html_url }} | **Author:** @${{ github.event.pull_request.user.login }}
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
